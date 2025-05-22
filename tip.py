@@ -324,7 +324,7 @@ async def process_tip_and_notify(
         tipper_wallet = factory.functions.getWallet(int(tipper_fid)).call()
         if tipper_wallet == "0x0000000000000000000000000000000000000000":
             logger.error(f"No smart wallet found for FID: {tipper_fid}")
-            await send_cast_reply("❌ Please create a smart wallet first in the miniapp.", cast_hash)
+            await send_cast_reply("❌ Please create a smart wallet first in the miniapp:https://warpcast.com/miniapps/nlTxSg9aEUXH/montip", cast_hash)
             return
         # 3. Get wallet contract
         wallet = w3.eth.contract(
