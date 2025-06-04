@@ -292,16 +292,22 @@ async def fetch_parent_cast(parent_hash: str) -> Dict:
 # Tip Processing Functions
 # ============================================================================
 async def parse_tip_command(text: str) -> Optional[Tuple[str, float, str]]:
+    # Allow !montip anywhere, and 'tip' is optional
     parts = text.lower().split()
-    if len(parts) < 4 or parts[0] != "!montip" or parts[1] != "tip":
+    if '!montip' not in parts:
         return None
+    idx = parts.index('!montip')
+    # Accept both '!montip tip' and '!montip' (tip optional)
+    if len(parts) > idx + 1 and parts[idx + 1] == 'tip':
+        idx += 1  # skip 'tip'
+    # Now expect: !montip [tip] <amount> <token>
     try:
-        amount = float(parts[2])
-        token = parts[3].lstrip('$').upper()  # Support mon, MON, $mon, $MON, etc.
+        amount = float(parts[idx + 1])
+        token = parts[idx + 2].lstrip('$').upper()
         if token not in SUPPORTED_TOKENS:
             return None
-        return parts[0], amount, token
-    except ValueError:
+        return '!montip', amount, token
+    except (IndexError, ValueError):
         return None
 
 async def process_tip_and_notify(
@@ -324,7 +330,7 @@ async def process_tip_and_notify(
         tipper_wallet = factory.functions.getWallet(int(tipper_fid)).call()
         if tipper_wallet == "0x0000000000000000000000000000000000000000":
             logger.error(f"No smart wallet found for FID: {tipper_fid}")
-            await send_cast_reply("❌ Please create a smart wallet first in the miniapp:https://warpcast.com/miniapps/nlTxSg9aEUXH/montip", cast_hash)
+            await send_cast_reply("❌ Please create a smart wallet first in the miniapp.", cast_hash)
             return
         # 3. Get wallet contract
         wallet = w3.eth.contract(
@@ -470,8 +476,8 @@ async def webhook_listener(request: Request, background_tasks: BackgroundTasks):
             tipper_fid = cast.get("author", {}).get("fid")
             parent_hash = cast.get("parent_hash")
             cast_hash = cast.get("hash")
-            # Only process if the cast starts with !montip and has a parent_hash
-            is_command = text.strip().startswith("!montip")
+            # Only process if !montip is present and has a parent_hash
+            is_command = '!montip' in text
             if not is_command or not parent_hash:
                 logger.info(f"Cast ignored: Not a !montip command or not a reply. Text: {text}")
                 return {"status": "ignored"}
