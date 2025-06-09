@@ -4,7 +4,7 @@
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 from web3 import Web3, HTTPProvider
-import requests
+
 import os
 from dotenv import load_dotenv
 import logging
@@ -19,6 +19,7 @@ import uvicorn
 import logging.handlers
 import queue
 import threading
+from supabase import create_client, Client
 
 # ============================================================================
 # Async Logging Setup (WARNING and ERROR only)
@@ -52,11 +53,23 @@ BOT_USERNAME = os.getenv("BOT_USERNAME")
 BOT_FID = os.getenv("BOT_FID")
 NEYNAR_API_KEY = os.getenv("NEYNAR_API_KEY")
 NEYNAR_WEBHOOK_SECRET = os.getenv("NEYNAR_WEBHOOK_SECRET")
-NEYNAR_SIGNER_UUID = os.getenv("NEYNAR_SIGNER_UUID")
-MONAD_EXPLORER_URL = "https://testnet.monadexplorer.com/tx/"
+
+
 FACTORY_ADDRESS = os.getenv("FACTORY_ADDRESS")
 TIP_BOT_PRIVATE_KEY = os.getenv("TIP_BOT_PRIVATE_KEY")
 TIP_BOT_ADDRESS = os.getenv("TIP_BOT_ADDRESS")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Initialize Supabase client
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.error("Missing Supabase credentials")
+    raise ValueError("Missing Supabase credentials")
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    logger.error(f"Failed to initialize Supabase client: {str(e)}")
+    raise
 
 # ============================================================================
 # Web3 Setup
@@ -236,50 +249,55 @@ def get_tip_bot_private_key():
         raise ValueError("Private key contains invalid hexadecimal characters")
     return private_key
 
+async def store_tip_details(
+    tx_hash: str,
+    tx_status: str,
+    tipper_fid: str,
+    tipper_username: str,
+    tipper_wallet: str,
+    recipient_fid: str,
+    recipient_username: str,
+    recipient_wallet: str,
+    token_symbol: str,
+    token_address: str,
+    amount: float,
+    amount_wei: int,  # Keep parameter for compatibility but don't store
+    cast_hash: str,
+    parent_cast_hash: str,
+    block_number: int,
+    gas_used: int,
+    cast_timestamp: str,
+    failure_reason: Optional[str] = None
+):
+    try:
+        data = {
+            "tx_hash": tx_hash,
+            "tx_status": tx_status,
+            "timestamp": cast_timestamp,
+            "tipper_fid": int(tipper_fid) if tipper_fid else None,
+            "tipper_username": tipper_username or "unknown",
+            "tipper_wallet": tipper_wallet,
+            "recipient_fid": int(recipient_fid) if recipient_fid else None,
+            "recipient_username": recipient_username or "unknown",
+            "recipient_wallet": recipient_wallet,
+            "token_symbol": token_symbol,
+            "token_address": token_address,
+            "amount": amount,
+            # Removed amount_wei from database storage to prevent bigint overflow
+            "cast_hash": cast_hash,
+            "parent_cast_hash": parent_cast_hash,
+            "block_number": block_number,
+            "gas_used": gas_used,
+            "failure_reason": failure_reason
+        }
+        response = supabase.table("tip_transactions").insert(data).execute()
+        logger.info(f"Stored tip details in Supabase: {response.data}")
+    except Exception as e:
+        logger.error(f"Error storing tip details in Supabase: {str(e)}")
+
 # ============================================================================
 # Farcaster API Functions
 # ============================================================================
-async def send_cast_reply(text: str, parent_hash: str) -> bool:
-    url = "https://api.neynar.com/v2/farcaster/cast"
-    payload = {
-        "signer_uuid": NEYNAR_SIGNER_UUID,
-        "text": text,
-        "parent": parent_hash
-    }
-    headers = {
-        "x-api-key": NEYNAR_API_KEY,
-        "Content-Type": "application/json"
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            logger.info(f"Cast reply sent successfully: {response.text}")
-            return True
-    except Exception as e:
-        logger.error(f"Error sending cast reply (async): {str(e)}")
-        return send_cast_reply_sync(text, parent_hash)
-
-def send_cast_reply_sync(text: str, parent_hash: str) -> bool:
-    url = "https://api.neynar.com/v2/farcaster/cast"
-    payload = {
-        "signer_uuid": NEYNAR_SIGNER_UUID,
-        "text": text,
-        "parent": parent_hash
-    }
-    headers = {
-        "x-api-key": NEYNAR_API_KEY,
-        "Content-Type": "application/json"
-    }
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        logger.info(f"Cast reply sent successfully: {response.text}")
-        return True
-    except Exception as e:
-        logger.error(f"Error sending cast reply (sync): {str(e)}")
-        return False
-
 async def fetch_parent_cast(parent_hash: str) -> Dict:
     url = f"https://api.neynar.com/v2/farcaster/cast?identifier={parent_hash}&type=hash"
     headers = {"x-api-key": NEYNAR_API_KEY}
@@ -317,6 +335,7 @@ async def process_tip_and_notify(
     tipper_fid: str,
     parent_hash: str,
     cast_hash: str,
+    cast_timestamp: str,  # Add cast timestamp parameter
 ) -> None:
     try:
         # 1. Get parent cast and recipient info
@@ -330,7 +349,26 @@ async def process_tip_and_notify(
         tipper_wallet = factory.functions.getWallet(int(tipper_fid)).call()
         if tipper_wallet == "0x0000000000000000000000000000000000000000":
             logger.error(f"No smart wallet found for FID: {tipper_fid}")
-            await send_cast_reply("❌ Please create a smart wallet first in the miniapp.", cast_hash)
+            await store_tip_details(
+                tx_hash="none",
+                tx_status="failed",
+                tipper_fid=tipper_fid,
+                tipper_username=cast["author"].get("username", "unknown"),
+                tipper_wallet="none",
+                recipient_fid=recipient_fid,
+                recipient_username=parent_cast["author"].get("username", "unknown"),
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address=SUPPORTED_TOKENS[token]["address"],
+                amount=amount,
+                amount_wei=int(amount * (10 ** SUPPORTED_TOKENS[token]["decimals"])),
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=0,
+                gas_used=0,
+                cast_timestamp=cast_timestamp,
+                failure_reason="No smart wallet found for tipper"
+            )
             return
         # 3. Get wallet contract
         wallet = w3.eth.contract(
@@ -339,7 +377,26 @@ async def process_tip_and_notify(
         )
         # 4. Check token support
         if token not in SUPPORTED_TOKENS:
-            await send_cast_reply(f"❌ Token {token} not supported.", cast_hash)
+            await store_tip_details(
+                tx_hash="none",
+                tx_status="failed",
+                tipper_fid=tipper_fid,
+                tipper_username=cast["author"].get("username", "unknown"),
+                tipper_wallet=tipper_wallet,
+                recipient_fid=recipient_fid,
+                recipient_username=parent_cast["author"].get("username", "unknown"),
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address="none",
+                amount=amount,
+                amount_wei=int(amount * (10 ** SUPPORTED_TOKENS[token]["decimals"])),
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=0,
+                gas_used=0,
+                cast_timestamp=cast_timestamp,
+                failure_reason="Unsupported token"
+            )
             return
         # 5. Convert addresses to checksum format
         try:
@@ -347,11 +404,49 @@ async def process_tip_and_notify(
             smart_wallet = ensure_checksum_address(tipper_wallet)
         except Exception as e:
             logger.error(f"Error converting addresses: {str(e)}")
-            await send_cast_reply(f"❌ Invalid address format.", cast_hash)
+            await store_tip_details(
+                tx_hash="none",
+                tx_status="failed",
+                tipper_fid=tipper_fid,
+                tipper_username=cast["author"].get("username", "unknown"),
+                tipper_wallet=tipper_wallet,
+                recipient_fid=recipient_fid,
+                recipient_username=parent_cast["author"].get("username", "unknown"),
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address=SUPPORTED_TOKENS[token]["address"],
+                amount=amount,
+                amount_wei=int(amount * (10 ** SUPPORTED_TOKENS[token]["decimals"])),
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=0,
+                gas_used=0,
+                cast_timestamp=cast_timestamp,
+                failure_reason=f"Invalid address format: {str(e)}"
+            )
             return
         # 6. Verify smart wallet
         if smart_wallet == "0x0000000000000000000000000000000000000000":
-            await send_cast_reply(f"❌ Please create a smart wallet first.", cast_hash)
+            await store_tip_details(
+                tx_hash="none",
+                tx_status="failed",
+                tipper_fid=tipper_fid,
+                tipper_username=cast["author"].get("username", "unknown"),
+                tipper_wallet=smart_wallet,
+                recipient_fid=recipient_fid,
+                recipient_username=parent_cast["author"].get("username", "unknown"),
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address=SUPPORTED_TOKENS[token]["address"],
+                amount=amount,
+                amount_wei=int(amount * (10 ** SUPPORTED_TOKENS[token]["decimals"])),
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=0,
+                gas_used=0,
+                cast_timestamp=cast_timestamp,
+                failure_reason="Smart wallet not created"
+            )
             return
         # 7. Process token transfer
         token_info = SUPPORTED_TOKENS[token]
@@ -366,18 +461,75 @@ async def process_tip_and_notify(
             contract_bot_address = wallet_contract.functions.botAddress().call()
             if contract_bot_address.lower() != bot_address.lower():
                 logger.error(f"Bot address {bot_address} not authorized for smart wallet {smart_wallet}")
-                await send_cast_reply(f"❌ Bot not authorized for this wallet.", cast_hash)
+                await store_tip_details(
+                    tx_hash="none",
+                    tx_status="failed",
+                    tipper_fid=tipper_fid,
+                    tipper_username=cast["author"].get("username", "unknown"),
+                    tipper_wallet=smart_wallet,
+                    recipient_fid=recipient_fid,
+                    recipient_username=parent_cast["author"].get("username", "unknown"),
+                    recipient_wallet=recipient_address,
+                    token_symbol=token,
+                    token_address=token_address,
+                    amount=amount,
+                    amount_wei=amount_wei,
+                    cast_hash=cast_hash,
+                    parent_cast_hash=parent_hash,
+                    block_number=0,
+                    gas_used=0,
+                    cast_timestamp=cast_timestamp,
+                    failure_reason="Bot not authorized for wallet"
+                )
                 return
             if token == "MON":
                 balance = w3.eth.get_balance(smart_wallet)
                 if balance < amount_wei:
-                    await send_cast_reply(f"❌ Insufficient MON balance in smart wallet.", cast_hash)
+                    await store_tip_details(
+                        tx_hash="none",
+                        tx_status="failed",
+                        tipper_fid=tipper_fid,
+                        tipper_username=cast["author"].get("username", "unknown"),
+                        tipper_wallet=smart_wallet,
+                        recipient_fid=recipient_fid,
+                        recipient_username=parent_cast["author"].get("username", "unknown"),
+                        recipient_wallet=recipient_address,
+                        token_symbol=token,
+                        token_address=token_address,
+                        amount=amount,
+                        amount_wei=amount_wei,
+                        cast_hash=cast_hash,
+                        parent_cast_hash=parent_hash,
+                        block_number=0,
+                        gas_used=0,
+                        cast_timestamp=cast_timestamp,
+                        failure_reason="Insufficient MON balance"
+                    )
                     return
             else:
                 token_contract = w3.eth.contract(address=token_address, abi=ERC20_ABI)
                 balance = token_contract.functions.balanceOf(smart_wallet).call()
                 if balance < amount_wei:
-                    await send_cast_reply(f"❌ Insufficient {token} balance in smart wallet.", cast_hash)
+                    await store_tip_details(
+                        tx_hash="none",
+                        tx_status="failed",
+                        tipper_fid=tipper_fid,
+                        tipper_username=cast["author"].get("username", "unknown"),
+                        tipper_wallet=smart_wallet,
+                        recipient_fid=recipient_fid,
+                        recipient_username=parent_cast["author"].get("username", "unknown"),
+                        recipient_wallet=recipient_address,
+                        token_symbol=token,
+                        token_address=token_address,
+                        amount=amount,
+                        amount_wei=amount_wei,
+                        cast_hash=cast_hash,
+                        parent_cast_hash=parent_hash,
+                        block_number=0,
+                        gas_used=0,
+                        cast_timestamp=cast_timestamp,
+                        failure_reason=f"Insufficient {token} balance"
+                    )
                     return
             try:
                 gas = wallet_contract.functions.sendTip(
@@ -385,7 +537,26 @@ async def process_tip_and_notify(
                 ).estimate_gas({'from': bot_address})
             except Exception as e:
                 logger.error(f"Gas estimation failed: {str(e)}")
-                await send_cast_reply(f"❌ Gas estimation failed: {str(e)}", cast_hash)
+                await store_tip_details(
+                    tx_hash="none",
+                    tx_status="failed",
+                    tipper_fid=tipper_fid,
+                    tipper_username=cast["author"].get("username", "unknown"),
+                    tipper_wallet=smart_wallet,
+                    recipient_fid=recipient_fid,
+                    recipient_username=parent_cast["author"].get("username", "unknown"),
+                    recipient_wallet=recipient_address,
+                    token_symbol=token,
+                    token_address=token_address,
+                    amount=amount,
+                    amount_wei=amount_wei,
+                    cast_hash=cast_hash,
+                    parent_cast_hash=parent_hash,
+                    block_number=0,
+                    gas_used=0,
+                    cast_timestamp=cast_timestamp,
+                    failure_reason=f"Gas estimation failed: {str(e)}"
+                )
                 return
             tx = wallet_contract.functions.sendTip(
                 recipient_address,
@@ -407,11 +578,49 @@ async def process_tip_and_notify(
                     logger.info(f"Transaction confirmed: {tx_hash.hex()}")
                 else:
                     logger.error(f"Transaction failed: {tx_hash.hex()}")
-                    await send_cast_reply(f"❌ Transaction failed.", cast_hash)
+                    await store_tip_details(
+                        tx_hash=tx_hash.hex(),
+                        tx_status="failed",
+                        tipper_fid=tipper_fid,
+                        tipper_username=cast["author"].get("username", "unknown"),
+                        tipper_wallet=smart_wallet,
+                        recipient_fid=recipient_fid,
+                        recipient_username=parent_cast["author"].get("username", "unknown"),
+                        recipient_wallet=recipient_address,
+                        token_symbol=token,
+                        token_address=token_address,
+                        amount=amount,
+                        amount_wei=amount_wei,
+                        cast_hash=cast_hash,
+                        parent_cast_hash=parent_hash,
+                        block_number=receipt.blockNumber,
+                        gas_used=receipt.gasUsed,
+                        cast_timestamp=cast_timestamp,
+                        failure_reason="Transaction reverted"
+                    )
                     return
             except Exception as e:
                 logger.error(f"Transaction confirmation failed: {str(e)}")
-                await send_cast_reply(f"❌ Transaction confirmation failed.", cast_hash)
+                await store_tip_details(
+                    tx_hash=tx_hash.hex() if 'tx_hash' in locals() else "none",
+                    tx_status="failed",
+                    tipper_fid=tipper_fid,
+                    tipper_username=cast["author"].get("username", "unknown"),
+                    tipper_wallet=smart_wallet,
+                    recipient_fid=recipient_fid,
+                    recipient_username=parent_cast["author"].get("username", "unknown"),
+                    recipient_wallet=recipient_address,
+                    token_symbol=token,
+                    token_address=token_address,
+                    amount=amount,
+                    amount_wei=amount_wei,
+                    cast_hash=cast_hash,
+                    parent_cast_hash=parent_hash,
+                    block_number=0,
+                    gas_used=gas if 'gas' in locals() else 0,
+                    cast_timestamp=cast_timestamp,
+                    failure_reason=f"Transaction confirmation failed: {str(e)}"
+                )
                 return
             try:
                 tipper_username = cast["author"].get("username", "unknown")
@@ -421,23 +630,94 @@ async def process_tip_and_notify(
                 recipient_username = parent_cast["author"].get("username", "unknown")
             except Exception:
                 recipient_username = "unknown"
-            tx_url = f"{MONAD_EXPLORER_URL}{tx_hash.hex()}"
-            reply_text = (
-                f"@{tipper_username} tipped @{recipient_username} {amount} {token}! 🎉\n"
-                f"View transaction: {tx_url}"
+            await store_tip_details(
+                tx_hash=tx_hash.hex(),
+                tx_status="success",
+                tipper_fid=tipper_fid,
+                tipper_username=tipper_username,
+                tipper_wallet=smart_wallet,
+                recipient_fid=recipient_fid,
+                recipient_username=recipient_username,
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address=token_address,
+                amount=amount,
+                amount_wei=amount_wei,
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=receipt.blockNumber,
+                gas_used=receipt.gasUsed,
+                cast_timestamp=cast_timestamp,
+                failure_reason=None
             )
-            await send_cast_reply(reply_text, cast_hash)
         except ValueError as e:
             logger.error(f"Error sending transaction: {str(e)}")
-            await send_cast_reply(f"❌ Failed to send {token}: {str(e)}", cast_hash)
+            await store_tip_details(
+                tx_hash="none",
+                tx_status="failed",
+                tipper_fid=tipper_fid,
+                tipper_username=cast["author"].get("username", "unknown"),
+                tipper_wallet=smart_wallet,
+                recipient_fid=recipient_fid,
+                recipient_username=parent_cast["author"].get("username", "unknown"),
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address=token_address,
+                amount=amount,
+                amount_wei=amount_wei,
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=0,
+                gas_used=gas if 'gas' in locals() else 0,
+                cast_timestamp=cast_timestamp,
+                failure_reason=f"Transaction error: {str(e)}"
+            )
             return
         except Exception as e:
-            logger.error(f"Error sending transaction: {str(e)}")
-            await send_cast_reply(f"❌ Failed to send {token}.", cast_hash)
+            logger.error(f"Error processing tip: {str(e)}")
+            await store_tip_details(
+                tx_hash="none",
+                tx_status="failed",
+                tipper_fid=tipper_fid,
+                tipper_username=cast["author"].get("username", "unknown"),
+                tipper_wallet=smart_wallet,
+                recipient_fid=recipient_fid,
+                recipient_username=parent_cast["author"].get("username", "unknown"),
+                recipient_wallet=recipient_address,
+                token_symbol=token,
+                token_address=token_address,
+                amount=amount,
+                amount_wei=amount_wei,
+                cast_hash=cast_hash,
+                parent_cast_hash=parent_hash,
+                block_number=0,
+                gas_used=gas if 'gas' in locals() else 0,
+                cast_timestamp=cast_timestamp,
+                failure_reason=f"Processing error: {str(e)}"
+            )
             return
     except Exception as e:
         logger.error(f"Error processing tip: {str(e)}")
-        await send_cast_reply(f"❌ Error processing tip: {str(e)}", cast_hash)
+        await store_tip_details(
+            tx_hash="none",
+            tx_status="failed",
+            tipper_fid=tipper_fid,
+            tipper_username=cast["author"].get("username", "unknown"),
+            tipper_wallet="none",
+            recipient_fid=recipient_fid,
+            recipient_username=parent_cast["author"].get("username", "unknown") if 'parent_cast' in locals() else "unknown",
+            recipient_wallet=recipient_address if 'recipient_address' in locals() else "none",
+            token_symbol=token,
+            token_address=SUPPORTED_TOKENS[token]["address"] if token in SUPPORTED_TOKENS else "none",
+            amount=amount,
+            amount_wei=int(amount * (10 ** SUPPORTED_TOKENS[token]["decimals"])) if token in SUPPORTED_TOKENS else 0,
+            cast_hash=cast_hash,
+            parent_cast_hash=parent_hash,
+            block_number=0,
+            gas_used=0,
+            cast_timestamp=cast_timestamp,
+            failure_reason=f"General processing error: {str(e)}"
+        )
 
 # ============================================================================
 # FastAPI App Setup
@@ -476,6 +756,7 @@ async def webhook_listener(request: Request, background_tasks: BackgroundTasks):
             tipper_fid = cast.get("author", {}).get("fid")
             parent_hash = cast.get("parent_hash")
             cast_hash = cast.get("hash")
+            cast_timestamp = cast.get("timestamp")  # Extract the cast timestamp
             # Only process if !montip is present and has a parent_hash
             is_command = '!montip' in text
             if not is_command or not parent_hash:
@@ -493,7 +774,8 @@ async def webhook_listener(request: Request, background_tasks: BackgroundTasks):
                 token=token,
                 tipper_fid=tipper_fid,
                 parent_hash=parent_hash,
-                cast_hash=cast_hash
+                cast_hash=cast_hash,
+                cast_timestamp=cast_timestamp  # Pass the cast timestamp
             )
             return {"status": "processing"}
         return {"status": "ok"}
