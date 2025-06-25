@@ -8,11 +8,11 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.16
-      - key: PIP_CACHE_DIR
-        value: /tmp/pip-cache
-      - key: CARGO_HOME
-        value: /tmp/cargo-cache
-      - key: PIP_NO_BUILD_ISOLATION
+      - key: PIP_DISABLE_PIP_VERSION_CHECK
+        value: "1"
+      - key: PIP_NO_CACHE_DIR
+        value: "1"
+      - key: PYTHONUNBUFFERED
         value: "1"
     buildFilter:
       paths:
