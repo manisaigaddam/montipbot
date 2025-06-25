@@ -8,7 +8,14 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.16
+      - key: PIP_CACHE_DIR
+        value: /tmp/pip-cache
       - key: CARGO_HOME
-        value: /opt/render/.cargo
-      - key: RUSTUP_HOME
-        value: /opt/render/.rustup 
+        value: /tmp/cargo-cache
+      - key: PIP_NO_BUILD_ISOLATION
+        value: "1"
+    buildFilter:
+      paths:
+        - requirements.txt
+        - tip.py
+        - build.sh 
