@@ -7,11 +7,13 @@ services:
     startCommand: uvicorn tip:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.16
+        value: 3.12.2
       - key: CARGO_HOME
         value: $HOME/.cargo
       - key: RUSTUP_HOME
         value: $HOME/.rustup
+      - key: PYO3_USE_ABI3_FORWARD_COMPATIBILITY
+        value: "1"
     buildFilter:
       paths:
         - requirements.txt
