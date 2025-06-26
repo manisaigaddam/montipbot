@@ -26,4 +26,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE $PORT
 
 # Start the application with Gunicorn
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:$PORT", "tip:app"]
+CMD ["uvicorn", "tip:app", "--host", "0.0.0.0", "--port", "$PORT"]
